@@ -13,41 +13,34 @@ project(
     'b_lto=true',
     'warning_level=3'
   ],
-  meson_version: '>=0.47.0'
+  meson_version: '>=0.62.0'
 )
 
 # Check just in case downstream decides to edit the source
 # and add a project version
 version = meson.project_version()
 if version == 'undefined'
-  git = find_program('git', required: false)
-  if git.found()
-    result = run_command(git, 'describe', '--tags', '--abbrev=0')
-    if result.returncode() == 0
-      version = result.stdout().strip('v\n')
-    endif
-  endif
+  cxx = meson.get_compiler('cpp')
+  version = cxx.get_define('CPPHTTPLIB_VERSION',
+    prefix: '#include <httplib.h>',
+    include_directories: include_directories('.')).strip('"')
+  assert(version != '', 'failed to get version from httplib.h')
 endif
-
-python = import('python').find_installation('python3')
-# If version is still undefined it means that the git method failed
-if version == 'undefined'
-  # Meson doesn't have regular expressions, but since it is implemented
-  # in python we can be sure we can use it to parse the file manually
-  version = run_command(
-      python, '-c', 'import re; raw_version = re.search("User\-Agent.*cpp\-httplib/([0-9]+\.?)+", open("httplib.h").read()).group(0); print(re.search("([0-9]+\\.?)+", raw_version).group(0))'
-  ).stdout().strip()
-endif
-
-message('cpp-httplib version ' + version)
 
 deps = [dependency('threads')]
 args = []
 
-openssl_dep = dependency('openssl', version: ['>=1.1.1', '<1.1.2'], required: get_option('cpp-httplib_openssl'))
+openssl_dep = dependency('openssl', version: '>=3.0.0', required: get_option('cpp-httplib_openssl'))
 if openssl_dep.found()
   deps += openssl_dep
   args += '-DCPPHTTPLIB_OPENSSL_SUPPORT'
+  if host_machine.system() == 'darwin'
+    macosx_keychain_dep = dependency('appleframeworks', modules: ['CoreFoundation', 'Security'], required: get_option('cpp-httplib_macosx_keychain'))
+    if macosx_keychain_dep.found()
+        deps += macosx_keychain_dep
+        args += '-DCPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN'
+    endif  
+  endif
 endif
 
 zlib_dep = dependency('zlib', required: get_option('cpp-httplib_zlib'))
@@ -75,11 +68,13 @@ endif
 cpp_httplib_dep = dependency('', required: false)
 
 if get_option('cpp-httplib_compile')
+  python3 = find_program('python3')
+
   httplib_ch = custom_target(
     'split',
     input: 'httplib.h',
     output: ['httplib.cc', 'httplib.h'],
-    command: [python, files('split.py'), '--out', meson.current_build_dir()],
+    command: [python3, files('split.py'), '--out', meson.current_build_dir()],
     install: true,
     install_dir: [false, get_option('includedir')]
   )
@@ -89,6 +84,7 @@ if get_option('cpp-httplib_compile')
     dependencies: deps,
     cpp_args: args,
     version: version,
+    soversion: version.split('.')[0] + '.' + version.split('.')[1],
     install: true
   )
   cpp_httplib_dep = declare_dependency(compile_args: args, dependencies: deps, link_with: lib, sources: httplib_ch[1])
@@ -102,12 +98,18 @@ if get_option('cpp-httplib_compile')
   )
 else
   install_headers('httplib.h')
-  cpp_httplib_dep = declare_dependency(compile_args: args, dependencies: deps, include_directories: include_directories('.'))
+  cpp_httplib_dep = declare_dependency(compile_args: args, dependencies: deps, include_directories: '.')
+
+  import('pkgconfig').generate(
+    name: 'cpp-httplib',
+    description: 'A C++ HTTP/HTTPS server and client library',
+    install_dir: get_option('datadir')/'pkgconfig',
+    url: 'https://github.com/yhirose/cpp-httplib',
+    version: version
+  )
 endif
 
-if meson.version().version_compare('>=0.54.0')
-  meson.override_dependency('cpp-httplib', cpp_httplib_dep)
-endif
+meson.override_dependency('cpp-httplib', cpp_httplib_dep)
 
 if get_option('cpp-httplib_test')
   subdir('test')
