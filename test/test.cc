@@ -146,6 +146,131 @@ TEST(BenchmarkTest, localhost) { performance_test("localhost"); }
 
 TEST(BenchmarkTest, v6) { performance_test("::1"); }
 
+TEST(VulnerabilityTest, CRLFInjection) {
+  Server svr;
+
+  svr.Post("/test1", [](const Request & /*req*/, Response &res) {
+    res.set_content("Hello 1", "text/plain");
+  });
+
+  svr.Delete("/test2", [](const Request & /*req*/, Response &res) {
+    res.set_content("Hello 2", "text/plain");
+  });
+
+  svr.Put("/test3", [](const Request & /*req*/, Response &res) {
+    res.set_content("Hello 3", "text/plain");
+  });
+
+  svr.Patch("/test4", [](const Request & /*req*/, Response &res) {
+    res.set_content("Hello 4", "text/plain");
+  });
+
+  svr.set_logger([](const Request &req, const Response & /*res*/) {
+    for (const auto &x : req.headers) {
+      auto key = x.first;
+      EXPECT_STRNE("evil", key.c_str());
+    }
+  });
+
+  auto thread = std::thread([&]() { svr.listen(HOST, PORT); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    thread.join();
+    ASSERT_FALSE(svr.is_running());
+  });
+
+  svr.wait_until_ready();
+
+  {
+    Client cli(HOST, PORT);
+
+    cli.Post("/test1", "A=B",
+             "application/x-www-form-urlencoded\r\nevil: hello1");
+    cli.Delete("/test2", "A=B", "text/plain\r\nevil: hello2");
+    cli.Put("/test3", "text", "text/plain\r\nevil: hello3");
+    cli.Patch("/test4", "content", "text/plain\r\nevil: hello4");
+  }
+}
+
+TEST(VulnerabilityTest, CRLFInjectionInHeaders) {
+  auto server_thread = std::thread([] {
+    auto srv = ::socket(AF_INET, SOCK_STREAM, 0);
+#ifndef _WIN32
+    httplib::default_socket_options(srv);
+#endif
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    ::inet_pton(AF_INET, HOST, &addr.sin_addr);
+    ::bind(srv, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
+    ::listen(srv, 1);
+
+    sockaddr_in cli_addr{};
+    socklen_t cli_len = sizeof(cli_addr);
+    auto cli = ::accept(srv, reinterpret_cast<sockaddr *>(&cli_addr), &cli_len);
+
+    struct timeval tv;
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    ::setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO,
+#ifdef _WIN32
+                 reinterpret_cast<const char *>(&tv),
+#else
+                 &tv,
+#endif
+                 sizeof(tv));
+
+    std::string buf_all;
+    char buf[2048];
+    ssize_t n;
+
+    while ((n = ::recv(cli, buf, sizeof(buf), 0)) > 0) {
+      buf_all.append(buf, static_cast<size_t>(n));
+
+      size_t pos;
+      while ((pos = buf_all.find("\r\n\r\n")) != std::string::npos) {
+        auto request_block = buf_all.substr(0, pos + 4); // include separator
+
+        auto e = request_block.find("\r\n");
+        if (e != std::string::npos) {
+          auto request_line = request_block.substr(0, e);
+          std::string msg =
+              "CRLF injection detected in request line: '" + request_line + "'";
+          EXPECT_FALSE(true) << msg;
+        }
+
+        std::string resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHello";
+        ::send(cli, resp.c_str(), resp.size(), 0);
+
+        buf_all.erase(0, pos + 4);
+      }
+    }
+
+#ifdef _WIN32
+    ::closesocket(cli);
+    ::closesocket(srv);
+#else
+    ::close(cli);
+    ::close(srv);
+#endif
+  });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  auto cli = httplib::Client(HOST, PORT);
+
+  auto headers = httplib::Headers{
+      {"A", "B\r\n\r\nGET /pwned HTTP/1.1\r\nHost: 127.0.0.1:1234\r\n\r\n"},
+      {"Connection", "keep-alive"}};
+
+  auto res = cli.Get("/hi", headers);
+  EXPECT_FALSE(res);
+  EXPECT_EQ(httplib::Error::InvalidHeaders, res.error());
+
+  server_thread.join();
+}
+
 class UnixSocketTest : public ::testing::Test {
 protected:
   void TearDown() override { std::remove(pathname_.c_str()); }
@@ -10624,132 +10749,6 @@ TEST(RedirectTest, Issue2185_Online) {
   EXPECT_EQ(9920427U, res->body.size());
 }
 #endif
-
-TEST(VulnerabilityTest, CRLFInjection) {
-  Server svr;
-
-  svr.Post("/test1", [](const Request & /*req*/, Response &res) {
-    res.set_content("Hello 1", "text/plain");
-  });
-
-  svr.Delete("/test2", [](const Request & /*req*/, Response &res) {
-    res.set_content("Hello 2", "text/plain");
-  });
-
-  svr.Put("/test3", [](const Request & /*req*/, Response &res) {
-    res.set_content("Hello 3", "text/plain");
-  });
-
-  svr.Patch("/test4", [](const Request & /*req*/, Response &res) {
-    res.set_content("Hello 4", "text/plain");
-  });
-
-  svr.set_logger([](const Request &req, const Response & /*res*/) {
-    for (const auto &x : req.headers) {
-      auto key = x.first;
-      EXPECT_STRNE("evil", key.c_str());
-    }
-  });
-
-  auto thread = std::thread([&]() { svr.listen(HOST, PORT); });
-  auto se = detail::scope_exit([&] {
-    svr.stop();
-    thread.join();
-    ASSERT_FALSE(svr.is_running());
-  });
-
-  svr.wait_until_ready();
-
-  {
-    Client cli(HOST, PORT);
-
-    cli.Post("/test1", "A=B",
-             "application/x-www-form-urlencoded\r\nevil: hello1");
-    cli.Delete("/test2", "A=B", "text/plain\r\nevil: hello2");
-    cli.Put("/test3", "text", "text/plain\r\nevil: hello3");
-    cli.Patch("/test4", "content", "text/plain\r\nevil: hello4");
-  }
-}
-
-TEST(VulnerabilityTest, CRLFInjectionInHeaders) {
-  auto server_thread = std::thread([] {
-    auto srv = ::socket(AF_INET, SOCK_STREAM, 0);
-    int on = 1;
-    ::setsockopt(srv, SOL_SOCKET, SO_REUSEADDR,
-#ifdef _WIN32
-                 reinterpret_cast<const char *>(&on),
-#else
-                 &on,
-#endif
-                 sizeof(on));
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(PORT);
-    ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-    ::bind(srv, reinterpret_cast<sockaddr *>(&addr), sizeof(addr));
-    ::listen(srv, 1);
-
-    sockaddr_in cli_addr{};
-    socklen_t cli_len = sizeof(cli_addr);
-    auto cli = ::accept(srv, reinterpret_cast<sockaddr *>(&cli_addr), &cli_len);
-
-    struct timeval tv;
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
-    ::setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO,
-#ifdef _WIN32
-                 reinterpret_cast<const char *>(&tv),
-#else
-                 &tv,
-#endif
-                 sizeof(tv));
-
-    std::string buf_all;
-    char buf[2048];
-    ssize_t n;
-
-    while ((n = ::recv(cli, buf, sizeof(buf), 0)) > 0) {
-      buf_all.append(buf, static_cast<size_t>(n));
-
-      size_t pos;
-      while ((pos = buf_all.find("\r\n\r\n")) != std::string::npos) {
-        auto request_block = buf_all.substr(0, pos + 4); // include separator
-
-        auto e = request_block.find("\r\n");
-        if (e != std::string::npos) {
-          auto request_line = request_block.substr(0, e);
-          std::string msg =
-              "CRLF injection detected in request line: '" + request_line + "'";
-          EXPECT_FALSE(true) << msg;
-        }
-
-        std::string resp = "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHello";
-        ::send(cli, resp.c_str(), resp.size(), 0);
-
-        buf_all.erase(0, pos + 4);
-      }
-    }
-
-    ::close(cli);
-    ::close(srv);
-  });
-
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-  auto cli = httplib::Client("127.0.0.1", PORT);
-
-  auto headers = httplib::Headers{
-      {"A", "B\r\n\r\nGET /pwned HTTP/1.1\r\nHost: 127.0.0.1:1234\r\n\r\n"},
-      {"Connection", "keep-alive"}};
-
-  auto res = cli.Get("/hi", headers);
-  EXPECT_FALSE(res);
-
-  if (res) { EXPECT_EQ(httplib::Error::InvalidHeaders, res.error()); }
-
-  server_thread.join();
-}
 
 TEST(PathParamsTest, StaticMatch) {
   const auto pattern = "/users/all";
